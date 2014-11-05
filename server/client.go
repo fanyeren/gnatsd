@@ -53,12 +53,19 @@ type client struct {
 }
 
 func (c *client) String() (id string) {
+	conn := "-"
+	if ip, ok := c.nc.(*net.TCPConn); ok {
+		addr := ip.RemoteAddr().(*net.TCPAddr)
+		conn = fmt.Sprintf("%s:%d", addr.IP, addr.Port)
+	}
+
 	switch c.typ {
 	case CLIENT:
-		id = fmt.Sprintf("cid:%d", c.cid)
+		id = fmt.Sprintf("%s - cid:%d", conn, c.cid)
 	case ROUTER:
-		id = fmt.Sprintf("rid:%d", c.cid)
+		id = fmt.Sprintf("%s - rid:%d", conn, c.cid)
 	}
+
 	return id
 }
 
@@ -85,14 +92,6 @@ var defaultOpts = clientOpts{Verbose: true, Pedantic: true}
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
-}
-
-func clientConnStr(conn net.Conn) interface{} {
-	if ip, ok := conn.(*net.TCPConn); ok {
-		addr := ip.RemoteAddr().(*net.TCPAddr)
-		return []string{fmt.Sprintf("%v, %d", addr.IP, addr.Port)}
-	}
-	return "N/A"
 }
 
 // Lock should be held
@@ -145,7 +144,7 @@ func (c *client) readLoop() {
 			return
 		}
 		if err := c.parse(b[:n]); err != nil {
-			Log(err, clientConnStr(c.nc), c.cid)
+			c.Errorf("Error reading from client: %s", err.Error())
 			// Auth was handled inline
 			if err != ErrAuthorization {
 				c.sendErr("Parser Error")
@@ -179,41 +178,48 @@ func (c *client) readLoop() {
 }
 
 func (c *client) traceMsg(msg []byte) {
+	if trace == 0 {
+		return
+	}
+
 	pm := fmt.Sprintf("Processing %s msg: %d", c.typeString(), c.inMsgs)
 	opa := []interface{}{pm, string(c.pa.subject), string(c.pa.reply), string(msg[:len(msg)-LEN_CR_LF])}
-	Trace(logStr(opa), fmt.Sprintf("c: %d", c.cid))
+	Tracef("MSG: %s", opa, c)
 }
 
 func (c *client) traceOp(op string, arg []byte) {
 	if trace == 0 {
 		return
 	}
+
 	opa := []interface{}{fmt.Sprintf("%s OP", op)}
 	if arg != nil {
 		opa = append(opa, fmt.Sprintf("%s %s", op, string(arg)))
 	}
-	Trace(logStr(opa), fmt.Sprintf("c: %d", c.cid))
+	Tracef("OP: %s", opa, c)
 }
 
 // Process the info message if we are a route.
 func (c *client) processRouteInfo(info *Info) {
+	c.mu.Lock()
 	if c.route == nil {
+		c.mu.Unlock()
 		return
 	}
 	c.route.remoteID = info.ID
+
 	// Check to see if we have this remote already registered.
 	// This can happen when both servers have routes to each other.
-	if c.srv.isDuplicateRemote(info.ID) {
-		Debug("Detected duplicate remote route", info.ID, clientConnStr(c.nc), c.cid)
-		c.closeConnection()
-	} else {
-		s := c.srv
-		s.mu.Lock()
-		s.remotes[info.ID] = c
-		s.mu.Unlock()
-		Debug("Registering remote route", info.ID)
+	s := c.srv
+	c.mu.Unlock()
+
+	if s.addRoute(c) {
+		Debugf("Registering remote route %q", info.ID, c)
 		// Send our local subscriptions to this route.
 		s.sendLocalSubsToRoute(c)
+	} else {
+		Debugf("Detected duplicate remote route %q", info.ID, c)
+		c.closeConnection()
 	}
 }
 
@@ -230,7 +236,7 @@ func (c *client) processInfo(arg []byte) error {
 }
 
 func (c *client) processErr(errStr string) {
-	Log(errStr, clientConnStr(c.nc), c.cid)
+	c.Errorf("Client error %s", errStr)
 	c.closeConnection()
 }
 
@@ -264,6 +270,11 @@ func (c *client) processConnect(arg []byte) error {
 	return nil
 }
 
+func (c *client) authTimeout() {
+	c.sendErr("Authorization Timeout")
+	c.closeConnection()
+}
+
 func (c *client) authViolation() {
 	c.sendErr("Authorization Violation")
 	c.closeConnection()
@@ -295,7 +306,7 @@ func (c *client) processPing() {
 	err := c.bw.Flush()
 	if err != nil {
 		c.clearConnection()
-		Debug("Error on Flush", err, clientConnStr(c.nc), c.cid)
+		Debugf("Error on Flush, error %s", err.Error(), c)
 	}
 	c.mu.Unlock()
 }
@@ -308,7 +319,7 @@ func (c *client) processPong() {
 }
 
 func (c *client) processMsgArgs(arg []byte) error {
-	if trace > 0 {
+	if trace == 0 {
 		c.traceOp("MSG", arg)
 	}
 
@@ -355,7 +366,7 @@ func (c *client) processMsgArgs(arg []byte) error {
 }
 
 func (c *client) processPub(arg []byte) error {
-	if trace > 0 {
+	if trace == 0 {
 		c.traceOp("PUB", arg)
 	}
 
@@ -447,6 +458,10 @@ func (c *client) processSub(argo []byte) (err error) {
 	}
 
 	c.mu.Lock()
+	if c.nc == nil {
+		c.mu.Unlock()
+		return nil
+	}
 	c.subs.Set(sub.sid, sub)
 	if c.srv != nil {
 		err = c.srv.sl.Insert(sub.subject, sub)
@@ -468,8 +483,10 @@ func (c *client) unsubscribe(sub *subscription) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if sub.max > 0 && sub.nm < sub.max {
-		Debugf("Deferring actual UNSUB(%s): %d max, %d received\n",
-			string(sub.subject), sub.max, sub.nm)
+		Debugf(
+			"Deferring actual UNSUB(%s): %d max, %d received\n",
+			string(sub.subject), sub.max, sub.nm, c,
+		)
 		return
 	}
 	c.traceOp("DELSUB", sub.sid)
@@ -595,6 +612,7 @@ func (c *client) deliverMsg(sub *subscription, mh, msg []byte) {
 		goto writeErr
 	}
 
+	// TODO(dlc) - Do we need this or can we just call always?
 	if deadlineSet {
 		client.nc.SetWriteDeadline(time.Time{})
 	}
@@ -610,10 +628,10 @@ writeErr:
 	client.mu.Unlock()
 
 	if ne, ok := err.(net.Error); ok && ne.Timeout() {
-		Log("Slow Consumer Detected", clientConnStr(client.nc), client.cid)
+		Noticef("Slow Consumer Detected", c)
 		client.closeConnection()
 	} else {
-		Debugf("Error writing msg: %v", err)
+		Debugf("Error writing msg: %v", err, c)
 	}
 }
 
@@ -719,14 +737,13 @@ func (c *client) processMsg(msg []byte) {
 			if rmap == nil {
 				rmap = make(map[string]struct{}, srv.numRoutes())
 			}
-			if sub.client == nil || sub.client.route == nil ||
+			if sub.client == nil || sub.client.nc == nil || sub.client.route == nil ||
 				sub.client.route.remoteID == "" {
-				Debug("Bad or Missing ROUTER Identity, not processing msg",
-					clientConnStr(c.nc), c.cid)
+				Debugf("Bad or Missing ROUTER Identity, not processing msg", c)
 				continue
 			}
 			if _, ok := rmap[sub.client.route.remoteID]; ok {
-				Debug("Ignoring route, already processed", c.cid)
+				Debugf("Ignoring route, already processed", c)
 				continue
 			}
 			rmap[sub.client.route.remoteID] = routeSeen
@@ -755,12 +772,12 @@ func (c *client) processPingTimer() {
 		return
 	}
 
-	Debug("Client Ping Timer", clientConnStr(c.nc), c.cid)
+	Debugf("Client Ping Timer", c)
 
 	// Check for violation
 	c.pout += 1
 	if c.pout > c.srv.opts.MaxPingsOut {
-		Debug("Stale Client Connection - Closing", clientConnStr(c.nc), c.cid)
+		Debugf("Stale Client Connection - Closing", c)
 		if c.bw != nil {
 			c.bw.WriteString(fmt.Sprintf("-ERR '%s'\r\n", "Stale Connection"))
 			c.bw.Flush()
@@ -773,7 +790,7 @@ func (c *client) processPingTimer() {
 	c.bw.WriteString("PING\r\n")
 	err := c.bw.Flush()
 	if err != nil {
-		Debug("Error on Client Ping Flush", err, clientConnStr(c.nc), c.cid)
+		Debugf("Error on Client Ping Flush, error %s", err)
 		c.clearConnection()
 	} else {
 		// Reset to fire again if all OK.
@@ -786,7 +803,7 @@ func (c *client) setPingTimer() {
 		return
 	}
 	d := c.srv.opts.PingInterval
-	c.ptmr = time.AfterFunc(d, func() { c.processPingTimer() })
+	c.ptmr = time.AfterFunc(d, c.processPingTimer)
 }
 
 // Lock should be held
@@ -800,7 +817,7 @@ func (c *client) clearPingTimer() {
 
 // Lock should be held
 func (c *client) setAuthTimer(d time.Duration) {
-	c.atmr = time.AfterFunc(d, func() { c.authViolation() })
+	c.atmr = time.AfterFunc(d, func() { c.authTimeout() })
 }
 
 // Lock should be held
@@ -826,7 +843,6 @@ func (c *client) clearConnection() {
 	}
 	c.bw.Flush()
 	c.nc.Close()
-	c.nc = nil
 }
 
 func (c *client) typeString() string {
@@ -846,13 +862,12 @@ func (c *client) closeConnection() {
 		return
 	}
 
-	// FIXME(dlc) - This creates garbage for no reason.
-	dbgString := fmt.Sprintf("%s connection closed", c.typeString())
-	Debug(dbgString, clientConnStr(c.nc), c.cid)
+	Debugf("%s connection closed", c.typeString(), c)
 
 	c.clearAuthTimer()
 	c.clearPingTimer()
 	c.clearConnection()
+	c.nc = nil
 
 	// Snapshot for use.
 	subs := c.subs.All()
@@ -884,11 +899,16 @@ func (c *client) closeConnection() {
 		defer srv.mu.Unlock()
 		rid := c.route.remoteID
 		if rid != "" && srv.remotes[rid] != nil {
-			Debug("Not attempting reconnect for solicited route, already connected.", rid)
+			Debugf("Not attempting reconnect for solicited route, already connected. Try %d", rid, c)
 			return
 		} else {
-			Debug("Attempting reconnect for solicited route", c.cid)
+			Debugf("Attempting reconnect for solicited route", c)
 			go srv.reConnectToRoute(c.route.url)
 		}
 	}
+}
+
+func (c *client) Errorf(format string, v ...interface{}) {
+	format = fmt.Sprintf("%s - %s", c, format)
+	Errorf(format, v...)
 }

@@ -1,6 +1,6 @@
 # Gnatsd [![Build Status](https://travis-ci.org/apcera/gnatsd.svg?branch=master)](http://travis-ci.org/apcera/gnatsd) [![Coverage Status](https://img.shields.io/coveralls/apcera/gnatsd.svg)](https://coveralls.io/r/apcera/gnatsd)
 
-A High Performance [NATS](https://github.com/derekcollison/nats) Server written in [Go.](http://golang.org)
+A High Performance [NATS](https://nats.io) Server written in [Go.](http://golang.org)
 
 ## Usage
 
@@ -16,6 +16,8 @@ Server options:
 Logging options:
     -l, --log FILE                   File to redirect log output
     -T, --logtime                    Timestamp log entries (default: true)
+    -s, --syslog                     Enable syslog as log method.
+    -r, --remote_syslog              Syslog server addr (udp://localhost:514).
     -D, --debug                      Enable debugging output
     -V, --trace                      Trace the raw protocol
 
@@ -76,9 +78,33 @@ pid_file: "/tmp/gnatsd.pid"
 ```
 
 
-## Nats client libraries
+## Building
 
-There are several client language bindings.
+This code currently requires at _least_ version 1.1 of Go, but we encourage
+the use of the latest stable release.  Go is still young and improving
+rapidly, new releases provide performance improvements and fixes.  Information
+on installation, including pre-built binaries, is available at
+<http://golang.org/doc/install>.  Stable branches of operating system
+packagers provided by your OS vendor may not be sufficient.
+
+Run `go version` to see the version of Go which you have installed.
+
+Run `go build` inside the directory to build.
+
+Run `go test ./...` to run the unit regression tests.
+
+A successful build run produces no messages and creates an executable called
+`gnatsd` in this directory.  You can invoke that binary, with no options and
+no configuration file, to start a server with acceptable standalone defaults
+(no authentication, no clustering).
+
+Run `go help` for more guidance, and visit <http://golang.org/> for tutorials,
+presentations, references and more.
+
+
+## Client libraries
+
+There are several client language bindings for NATS.
 - [Go](https://github.com/apcera/nats)
 - [Java](https://github.com/tyagihas/java_nats)
 - [Java - Spring](https://github.com/mheath/jnats)
